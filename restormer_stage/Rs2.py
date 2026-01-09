@@ -1,37 +1,38 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Restormer 기반 GCM(tasmax_raw) / tmax_vit -> tmax_obs 복원 학습 스크립트 (64x64 패치)
+Training script for restoring GCM(tasmax_raw) / tmax_vit -> tmax_obs using Restormer (64x64 patches)
 
-옵션:
-    - use_gcm_input = True  이면:
-        * 입력: tasmax_raw.nc (변수 gcm_var, 예: "tasmax_raw")
-        * 타깃: tmax_all_methods_comparison.nc 의 tmax_obs
-        * tasmax_raw 를 tmax_obs 의 time/lat/lon 격자로 xarray.interp 으로 보간 후 사용
-    - use_gcm_input = False 이면:
-        * 입력: tmax_all_methods_comparison.nc 의 input_var (예: tmax_vit)
-        * 타깃: tmax_obs
+Options:
+    - If use_gcm_input = True:
+        * Input: tasmax_raw.nc (variable gcm_var, e.g., "tasmax_raw")
+        * Target: tmax_obs in tmax_all_methods_comparison.nc
+        * tasmax_raw is interpolated onto the time/lat/lon grid of tmax_obs using xarray.interp
 
-공통:
-- 원본 타깃 차원: (time, lat, lon) ≈ (12784, 200, 280)
-- 학습/평가: 64x64 패치
-- 매 epoch:
-    * 64x64 검증 패치 PNG 저장
-    * 200x280 전체 도메인 한 장을 64x64 타일로 슬라이딩 추론 후 PNG 저장
-    * 전체 도메인 추론 결과에 대해 PSNR/SSIM 계산 및 로그/CSV 저장
-    * baseline (입력 vs 타깃) PSNR/SSIM도 CSV에 함께 기록
+    - If use_gcm_input = False:
+        * Input: input_var in tmax_all_methods_comparison.nc (e.g., tmax_vit)
+        * Target: tmax_obs
 
-필수:
+Common settings:
+- Original target dimensions: (time, lat, lon) ≈ (12784, 200, 280)
+- Training/validation: 64x64 patches
+- Every epoch:
+    * Save PNGs of 64x64 validation patches
+    * Perform sliding-window inference over the full 200x280 domain using 64x64 tiles and save PNG
+    * Compute PSNR/SSIM on the full-domain inference result and save logs/CSV
+    * Also record baseline (input vs target) PSNR/SSIM in the same CSV
+
+Requirements:
     pip install xarray netCDF4 tqdm matplotlib
-    + Restormer 원본 코드(restormer_arch.py)를 같은 디렉토리에 두고
-      from restormer_arch import Restormer 로 import 가능하게 해둘 것.
+    + Put the original Restormer code (restormer_arch.py) in the same directory
+      so that it is importable with: from restormer_arch import Restormer
 """
 
 import os
 import math
 import random
 from types import SimpleNamespace
-import csv  # CSV 저장
+import csv  # CSV logging
 
 import numpy as np
 import torch
@@ -43,17 +44,17 @@ from torch.cuda import amp
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
-# 그림 저장을 위한 matplotlib (X 없이 사용 가능하게 Agg backend)
+# matplotlib for saving figures (use Agg backend to work without X)
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# Restormer 본체는 GitHub에서 가져온 파일을 import
-from restormer_arch import Restormer   # <- 파일 이름/클래스 이름에 맞게 조정
+# Restormer core is imported from the GitHub file
+from restormer_arch import Restormer   # <- adjust to match file/class name
 
 
 # ---------------------------------------------------------
-# 0. 유틸
+# 0. Utilities
 # ---------------------------------------------------------
 def ensure_dir(path: str):
     if path and not os.path.exists(path):
@@ -79,15 +80,16 @@ def print_device():
 
 def _fill_nans_robust(arr: np.ndarray) -> np.ndarray:
     """
-    [T, H, W] 배열에서 NaN을 안전하게 채우는 함수.
-    - 먼저 time별 평균으로 채우고
-    - 그래도 남으면 전체 평균으로 채움
+    Safely fill NaNs in an array with shape [T, H, W].
+
+    - First fill using the time-wise mean for each time step.
+    - If NaNs still remain, fill them with the overall global mean.
     """
     arr = np.asarray(arr, dtype=np.float32)
     if not np.isnan(arr).any():
         return arr
 
-    # time 축 평균
+    # Time-wise mean
     m_t = np.nanmean(arr, axis=(1, 2), keepdims=True)  # [T,1,1]
     global_mean = np.nanmean(arr)
     if np.isnan(global_mean):
@@ -100,14 +102,14 @@ def _fill_nans_robust(arr: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------
-# 1. NetCDF 로딩
+# 1. NetCDF loading
 # ---------------------------------------------------------
 def _try_import_xarray():
     try:
         import xarray as xr
         return xr
     except Exception:
-        raise RuntimeError("xarray가 필요합니다. `pip install xarray netCDF4` 를 먼저 실행하세요.")
+        raise RuntimeError("xarray is required. Please run `pip install xarray netCDF4` first.")
 
 
 def load_tmax_nc(
@@ -116,21 +118,22 @@ def load_tmax_nc(
     target_var: str = "tmax_obs",
 ):
     """
-    NetCDF에서 (time, lat, lon) 형태의 input/target을 같은 파일에서 읽어 반환
+    Load input/target variables with shape (time, lat, lon)
+    from the same NetCDF file.
     """
     xr = _try_import_xarray()
     ds = xr.open_dataset(nc_path)
 
     if input_var not in ds or target_var not in ds:
         raise KeyError(
-            f"'{nc_path}' 안에 '{input_var}' 또는 '{target_var}' 변수가 없습니다. "
-            f"사용 가능한 변수: {list(ds.data_vars)}"
+            f"Variable '{input_var}' or '{target_var}' not found in '{nc_path}'. "
+            f"Available variables: {list(ds.data_vars)}"
         )
 
     x_da = ds[input_var]   # (time, lat, lon)
     y_da = ds[target_var]  # (time, lat, lon)
 
-    # 시간, 위도, 경도 이름은 그대로 두고 values만 사용
+    # Keep original names for time, lat, lon and only use values
     time_vals = x_da["time"].values if "time" in x_da.dims else np.arange(x_da.shape[0])
     lat_vals = x_da["lat"].values if "lat" in x_da.dims else np.arange(x_da.shape[1])
     lon_vals = x_da["lon"].values if "lon" in x_da.dims else np.arange(x_da.shape[2])
@@ -142,7 +145,7 @@ def load_tmax_nc(
 
     print(f"[NC] '{nc_path}' loaded: {input_var} = {x.shape}, {target_var} = {y.shape}")
 
-    # NaN robust fill
+    # Robust NaN filling
     x = _fill_nans_robust(x)
     y = _fill_nans_robust(y)
 
@@ -151,8 +154,10 @@ def load_tmax_nc(
 
 def _guess_dim_renames(da):
     """
-    GCM 변수에서 time/lat/lon 축 이름을 추측해서
-    {'원래이름': 'lat' or 'lon' or 'time'} 형태의 rename dict 반환
+    Guess dimension names for time/lat/lon in a GCM variable.
+
+    Returns a rename dict mapping original dim names to 'time', 'lat', or 'lon',
+    e.g., {'latitude': 'lat', 'longitude': 'lon'}.
     """
     rename = {}
     dims = list(da.dims)
@@ -189,28 +194,27 @@ def load_gcm_regridded_to_obs(
     gcm_var: str = "tasmax_raw",
 ):
     """
-    (1) obs NetCDF (예: tmax_all_methods_comparison.nc) 에서 target_var=tmax_obs 를 읽고
-    (2) GCM NetCDF (예: tasmax_raw.nc) 에서 gcm_var 를 읽은 뒤
-    (3) tmax_obs 의 time/lat/lon 격자로 xarray.interp 로 보간하여
-        x = 보간된 GCM, y = tmax_obs 를 반환.
+    (1) Read target_var=tmax_obs from an obs NetCDF file (e.g., tmax_all_methods_comparison.nc)
+    (2) Read gcm_var from a GCM NetCDF file (e.g., tasmax_raw.nc)
+    (3) Interpolate the GCM field onto the time/lat/lon grid of tmax_obs using xarray.interp
 
-    반환:
-        x, y, time_vals, lat_vals, lon_vals  (모두 obs 격자 기준)
+    Returns:
+        x, y, time_vals, lat_vals, lon_vals  (all on the obs grid)
     """
     xr = _try_import_xarray()
 
-    # --- 타깃(obs) ---
+    # --- Target (obs) ---
     ds_obs = xr.open_dataset(obs_nc_path)
     if target_var not in ds_obs:
         raise KeyError(
-            f"'{obs_nc_path}' 안에 '{target_var}' 변수가 없습니다. "
-            f"사용 가능한 변수: {list(ds_obs.data_vars)}"
+            f"Variable '{target_var}' not found in '{obs_nc_path}'. "
+            f"Available variables: {list(ds_obs.data_vars)}"
         )
     y_da = ds_obs[target_var]  # (time, lat, lon)
 
-    # obs 좌표
+    # Obs coordinates
     if not all(dim in y_da.dims for dim in ("time", "lat", "lon")):
-        raise ValueError(f"타깃 변수 '{target_var}'의 dims 가 (time, lat, lon)이 아닙니다: {y_da.dims}")
+        raise ValueError(f"Target variable '{target_var}' does not have dims (time, lat, lon): {y_da.dims}")
 
     time_obs = y_da["time"]
     lat_obs = y_da["lat"]
@@ -220,13 +224,13 @@ def load_gcm_regridded_to_obs(
     ds_gcm = xr.open_dataset(gcm_nc_path)
     if gcm_var not in ds_gcm:
         raise KeyError(
-            f"'{gcm_nc_path}' 안에 '{gcm_var}' 변수가 없습니다. "
-            f"사용 가능한 변수: {list(ds_gcm.data_vars)}"
+            f"Variable '{gcm_var}' not found in '{gcm_nc_path}'. "
+            f"Available variables: {list(ds_gcm.data_vars)}"
         )
 
     gcm_da = ds_gcm[gcm_var]
 
-    # 축 이름을 time/lat/lon 으로 맞춰 주기 (latitude, longitude 등 → lat, lon)
+    # Rename dimensions to time/lat/lon (e.g., latitude, longitude → lat, lon)
     rename = _guess_dim_renames(gcm_da)
     if rename:
         print(f"[GCM] rename dims: {rename}")
@@ -236,15 +240,15 @@ def load_gcm_regridded_to_obs(
     for dim in ("time", "lat", "lon"):
         if dim not in gcm_da.dims:
             raise ValueError(
-                f"GCM 변수 '{gcm_var}'에서 '{dim}' 축을 찾을 수 없습니다. dims={gcm_da.dims}"
+                f"Dimension '{dim}' not found in GCM variable '{gcm_var}'. dims={gcm_da.dims}"
             )
 
-    # 시간/공간 기준 정렬
+    # Sort in time/space
     gcm_da = gcm_da.sortby("time")
     y_da = y_da.sortby("time")
 
-    # --- obs 격자로 보간 ---
-    print("[GCM] interp to obs grid (time, lat, lon)...")
+    # --- Interpolate onto obs grid ---
+    print("[GCM] Interpolating to obs grid (time, lat, lon)...")
     gcm_interp = gcm_da.interp(
         time=time_obs,
         lat=lat_obs,
@@ -253,7 +257,7 @@ def load_gcm_regridded_to_obs(
     )
 
     x = gcm_interp.values.astype(np.float32)  # [T,H,W]
-    y = y_da.values.astype(np.float32)       # [T,H,W]
+    y = y_da.values.astype(np.float32)        # [T,H,W]
 
     ds_obs.close()
     ds_gcm.close()
@@ -274,15 +278,15 @@ def load_gcm_regridded_to_obs(
 
 
 # ---------------------------------------------------------
-# 2. Dataset (64x64 패치 기반)
+# 2. Dataset (patch-based 64x64)
 # ---------------------------------------------------------
 class TmaxRestorationDataset(Dataset):
     """
-    tmax_* -> tmax_obs 복원용 Dataset
+    Dataset for tmax_* -> tmax_obs restoration.
 
-    - patch_size=None  이면: 전체 이미지 (1, H, W)
-    - patch_size=64    이면: (1, 64, 64) 패치 크롭
-    - 글로벌 평균/표준편차로 정규화
+    - patch_size=None: use the full image (1, H, W)
+    - patch_size=64: randomly crop (1, 64, 64) patches
+    - Normalize with global mean/standard deviation
     """
     def __init__(
         self,
@@ -311,14 +315,14 @@ class TmaxRestorationDataset(Dataset):
         return len(self.indices)
 
     def _augment(self, x: torch.Tensor, y: torch.Tensor):
-        # 랜덤 좌우/상하 플립, 전치 (lat/lon swap)
+        # Random horizontal/vertical flips and transpose (lat/lon swap)
         if random.random() < 0.5:
             x = torch.flip(x, dims=[2])
             y = torch.flip(y, dims=[2])
         if random.random() < 0.5:
             x = torch.flip(x, dims=[1])
             y = torch.flip(y, dims=[1])
-        # 패치 크기(64x64)에서는 transpose 해도 shape 동일
+        # For 64x64 patches, transpose keeps shape identical
         if random.random() < 0.25:
             x = x.transpose(1, 2)
             y = y.transpose(1, 2)
@@ -327,7 +331,7 @@ class TmaxRestorationDataset(Dataset):
     def _crop_patch(self, x: torch.Tensor, y: torch.Tensor):
         """
         x, y: [1, H, W]
-        patch_size가 None이면 전체 사용, 아니면 H,W에서 패치 크롭
+        If patch_size is None, use the full image. Otherwise crop a patch of size (patch_size, patch_size).
         """
         if self.patch_size is None:
             return x, y
@@ -336,14 +340,14 @@ class TmaxRestorationDataset(Dataset):
         ps = self.patch_size
 
         if H < ps or W < ps:
-            # 패치 크기보다 작으면 그냥 전체 사용 (예외 상황)
+            # If the image is smaller than the patch size, just use the full image (rare case)
             return x, y
 
         if self.random_crop:
             top = random.randint(0, H - ps)
             left = random.randint(0, W - ps)
         else:
-            # 중앙 크롭 (validation용)
+            # Center crop (used for validation)
             top = (H - ps) // 2
             left = (W - ps) // 2
 
@@ -359,11 +363,11 @@ class TmaxRestorationDataset(Dataset):
         x = torch.from_numpy(x).unsqueeze(0)  # [1, H, W]
         y = torch.from_numpy(y).unsqueeze(0)  # [1, H, W]
 
-        # 안전장치: 혹시 남아 있을지 모를 NaN/Inf 제거
+        # Safety: remove any remaining NaN/Inf
         x = torch.nan_to_num(x, nan=self.mean, posinf=self.mean, neginf=self.mean)
         y = torch.nan_to_num(y, nan=self.mean, posinf=self.mean, neginf=self.mean)
 
-        # 패치 크롭 (train: 64x64, val_full_image=False 이면 64x64 중앙 패치)
+        # Patch crop (train: 64x64, validation: 64x64 center patch if val_full_image=False)
         x, y = self._crop_patch(x, y)
 
         if self.normalize:
@@ -382,12 +386,12 @@ def build_dataloaders(
     batch_size: int = 32,
     val_ratio: float = 0.2,
     seed: int = 42,
-    patch_size: int = 64,        # 학습용 패치 크기 (64x64)
-    val_full_image: bool = False, # 검증 시에도 64x64 사용 (True면 전체 200x280)
+    patch_size: int = 64,         # Training patch size (64x64)
+    val_full_image: bool = False, # If True, use full 200x280 images for validation (otherwise 64x64)
     val_batch_size: int = 32,
 ):
     """
-    x, y: [T, H, W]
+    Build training and validation DataLoaders from x, y with shape [T, H, W].
     """
     T = x.shape[0]
     indices = np.arange(T)
@@ -398,13 +402,13 @@ def build_dataloaders(
     val_idx = indices[:n_val]
     train_idx = indices[n_val:]
 
-    # 통계는 train 타임스텝 기준으로 계산
+    # Compute statistics on training time steps
     mean = float(y[train_idx].mean())
     std = float(y[train_idx].std() + 1e-8)
     stats = {"mean": mean, "std": std}
     print(f"[STATS] train target mean={mean:.4f}, std={std:.4f}")
 
-    # === train: 64x64 패치 랜덤 크롭 + augmentation ===
+    # === Train: random 64x64 patches + augmentation ===
     train_ds = TmaxRestorationDataset(
         x_all=x,
         y_all=y,
@@ -416,9 +420,9 @@ def build_dataloaders(
         random_crop=True,
     )
 
-    # === validation: 64x64 중앙 패치 또는 전체 이미지 ===
+    # === Validation: center 64x64 patches or full images ===
     if val_full_image:
-        # 전체 이미지 (200x280) 그대로 사용
+        # Use full 200x280 images
         val_ds = TmaxRestorationDataset(
             x_all=x,
             y_all=y,
@@ -426,11 +430,11 @@ def build_dataloaders(
             stats=stats,
             augment=False,
             normalize=True,
-            patch_size=None,      # 전체 사용
+            patch_size=None,      # use full image
             random_crop=False,
         )
     else:
-        # 64x64 중앙 패치 기반 검증
+        # 64x64 center patches for validation
         val_ds = TmaxRestorationDataset(
             x_all=x,
             y_all=y,
@@ -439,7 +443,7 @@ def build_dataloaders(
             augment=False,
             normalize=True,
             patch_size=patch_size,
-            random_crop=False,    # 중앙 크롭
+            random_crop=False,    # center crop
         )
 
     bs_val = val_batch_size
@@ -468,7 +472,7 @@ def build_dataloaders(
 # ---------------------------------------------------------
 class SSIMLoss(nn.Module):
     """
-    정규화 공간에서 쓰는 SSIM loss (1 - SSIM)
+    SSIM loss (1 - SSIM) computed in normalized space.
     """
     def __init__(self, win_size=11, C1=0.01**2, C2=0.03**2):
         super().__init__()
@@ -506,7 +510,7 @@ class SSIMLoss(nn.Module):
 
 class RestorationLoss(nn.Module):
     """
-    L1 + MSE + SSIM 조합 (가중치는 필요에 따라 조정)
+    Combination of L1 + MSE + SSIM losses (weights can be adjusted).
     """
     def __init__(self, w_l1=1.0, w_mse=0.0, w_ssim=0.1):
         super().__init__()
@@ -529,12 +533,13 @@ class RestorationLoss(nn.Module):
 
 
 # ---------------------------------------------------------
-# 3.5. Numpy 기반 PSNR/SSIM 헬퍼 (전체 도메인 추론용)
+# 3.5. Numpy-based PSNR/SSIM helpers (for full-domain inference)
 # ---------------------------------------------------------
 def psnr_np(pred: np.ndarray, target: np.ndarray) -> float:
     """
-    numpy 2D 이미지(pred, target)에서 PSNR 계산 (물리 단위 기준)
-    data_range는 target의 (max-min) 사용
+    Compute PSNR on numpy 2D images (pred, target) in physical units.
+
+    The data range is taken as (max(target) - min(target)).
     """
     pred = np.asarray(pred, dtype=np.float32)
     target = np.asarray(target, dtype=np.float32)
@@ -550,8 +555,9 @@ def psnr_np(pred: np.ndarray, target: np.ndarray) -> float:
 
 def ssim_np(pred: np.ndarray, target: np.ndarray) -> float:
     """
-    numpy 2D 이미지(pred, target)에서 SSIM 계산.
-    - target의 min,max로 [0,1] 정규화 후 위에서 정의한 SSIMLoss 사용
+    Compute SSIM on numpy 2D images (pred, target).
+
+    - Normalize to [0,1] using target's min and max, then use the SSIMLoss defined above.
     """
     pred = np.asarray(pred, dtype=np.float32)
     target = np.asarray(target, dtype=np.float32)
@@ -576,12 +582,12 @@ def ssim_np(pred: np.ndarray, target: np.ndarray) -> float:
 
 
 # ---------------------------------------------------------
-# 4. 모델 빌더 (Restormer)
+# 4. Model builder (Restormer)
 # ---------------------------------------------------------
 def build_restormer(
     inp_channels=1,
     out_channels=1,
-    dim=32,                          # 메모리 절약을 위한 작은 모델
+    dim=32,                          # small model to save memory
     num_blocks=(3, 3, 3, 3),
     num_refinement_blocks=3,
     heads=(1, 2, 4, 8),
@@ -590,8 +596,9 @@ def build_restormer(
     LayerNorm_type="WithBias",
 ):
     """
-    Restormer_arch.py 의 Restormer 시그니처에 맞게 조정해 사용.
-    (공식 구현과 동일/유사한 인자를 사용한다고 가정)
+    Build Restormer with a signature compatible with restormer_arch.py.
+
+    (Assumes the official implementation or a compatible variant.)
     """
     model = Restormer(
         inp_channels=inp_channels,
@@ -610,20 +617,21 @@ def build_restormer(
 
 
 # ---------------------------------------------------------
-# 4.5. 슬라이딩 타일 기반 전체 이미지 추론 (200x280)
+# 4.5. Sliding-tile full-image inference (200x280)
 # ---------------------------------------------------------
 @torch.no_grad()
 def predict_full_image_tiled(
     model: nn.Module,
-    x_full: torch.Tensor,   # [1, H, W] 또는 [B=1, 1, H, W]
+    x_full: torch.Tensor,   # [1, H, W] or [B=1, 1, H, W]
     tile_size: int = 64,
     overlap: int = 16,
     device: str = "cuda:0",
 ):
     """
-    64x64 패치 단위로 추론해서 다시 200x280으로 오버레이하는 함수.
-    - x_full: [1, H, W] (정규화된 입력 한 장)
-    - 리턴:   [1, H, W] (모델 출력, 정규화된 스케일)
+    Perform inference on a full 200x280 image by tiling 64x64 patches.
+
+    - x_full: [1, H, W] (normalized input single image)
+    - Returns: [1, H, W] (model output in normalized scale)
     """
     model.eval()
 
@@ -637,15 +645,15 @@ def predict_full_image_tiled(
     tile = tile_size
     stride = tile_size - overlap
 
-    # 출력/가중치 버퍼
+    # Output/weight buffers
     out = torch.zeros_like(x_full)
     weight = torch.zeros_like(x_full)
 
-    # 타일 시작 위치 계산
+    # Tile start positions
     ys = list(range(0, max(H - tile + 1, 1), stride))
     xs = list(range(0, max(W - tile + 1, 1), stride))
 
-    # 가장자리가 정확히 커버되도록 마지막 타일 추가
+    # Ensure edges are fully covered by adding final tiles
     if ys[-1] != H - tile:
         ys.append(H - tile)
     if xs[-1] != W - tile:
@@ -669,7 +677,7 @@ def predict_full_image_tiled(
             out[:, :, top:top+tile, left:left+tile] += pred_patch
             weight[:, :, top:top+tile, left:left+tile] += 1.0
 
-    # 0으로 나누는 것 방지
+    # Avoid division by zero
     weight = torch.clamp(weight, min=1.0)
     out = out / weight
 
@@ -693,7 +701,7 @@ class Trainer:
         max_epochs: int = 150,
         out_dir: str = "restormer_ckpt",
         use_amp: bool = True,
-        # 전체 도메인 예측용 예시 한 장 (200x280)
+        # Example full-domain image (200x280) for inference
         full_x_example: np.ndarray = None,  # [H, W]
         full_y_example: np.ndarray = None,  # [H, W]
         tile_size: int = 64,
@@ -705,7 +713,7 @@ class Trainer:
         self.val_loader = val_loader
         self.max_epochs = max_epochs
         self.out_dir = out_dir
-        self.stats = stats  # mean, std (정규화 정보)
+        self.stats = stats  # mean, std (normalization info)
         ensure_dir(out_dir)
         ensure_dir(os.path.join(out_dir, "epoch_png"))
         ensure_dir(os.path.join(out_dir, "epoch_png_full"))
@@ -717,13 +725,13 @@ class Trainer:
 
         self.best_val = float("inf")
 
-        # 전체 도메인 예시 저장 (없으면 None)
+        # Example full-domain images (if provided)
         self.full_x_example = full_x_example
         self.full_y_example = full_y_example
         self.tile_size = tile_size
         self.tile_overlap = tile_overlap
 
-        # === baseline PSNR/SSIM (입력 vs 타깃, 물리 단위) 계산 ===
+        # === Baseline PSNR/SSIM (input vs target, physical units) ===
         self.baseline_psnr = None
         self.baseline_ssim = None
         if (self.full_x_example is not None) and (self.full_y_example is not None):
@@ -737,20 +745,20 @@ class Trainer:
             except Exception as e:
                 print(f"[BASELINE] Failed to compute baseline PSNR/SSIM: {e}")
 
-        # 전체 도메인 PSNR/SSIM을 저장할 CSV 초기화
+        # Initialize CSV file for full-domain PSNR/SSIM
         self.full_metrics_csv = os.path.join(self.out_dir, "full_metrics.csv")
         if (not os.path.exists(self.full_metrics_csv)) or os.path.getsize(self.full_metrics_csv) == 0:
             with open(self.full_metrics_csv, "w", newline="") as f:
                 writer = csv.writer(f)
-                # epoch별 모델 성능 + baseline 성능 같이 기록
+                # Store epoch-wise model performance plus baseline
                 writer.writerow(["epoch", "full_psnr", "full_ssim",
                                  "baseline_psnr", "baseline_ssim"])
 
     @staticmethod
     def _psnr(pred: torch.Tensor, target: torch.Tensor) -> float:
         """
-        정규화 공간(평균0, 표준편차1)에서의 PSNR.
-        data_range=1 로 가정한 상대 지표.
+        PSNR in normalized space (mean 0, std 1).
+        Assumes data_range = 1, so this is a relative metric.
         """
         mse = F.mse_loss(pred, target).item()
         if mse <= 1e-12:
@@ -768,8 +776,9 @@ class Trainer:
         max_samples: int = 1,
     ):
         """
-        매 epoch마다 validation 첫 배치 기준으로 64x64 패치 PNG를 저장.
-        x, y, pred 는 정규화된 텐서 [B,1,H,W]
+        Save 64x64 patch PNGs for the first validation batch at each epoch.
+
+        x, y, pred are normalized tensors with shape [B,1,H,W].
         """
         mean = self.stats["mean"]
         std = self.stats["std"]
@@ -782,9 +791,9 @@ class Trainer:
         n_samples = min(max_samples, B)
 
         for i in range(n_samples):
-            in_img = x_np[i, 0] * std + mean   # 물리 단위
-            tgt_img = y_np[i, 0] * std + mean  # 물리 단위
-            prd_img = p_np[i, 0] * std + mean  # 물리 단위
+            in_img = x_np[i, 0] * std + mean   # physical units
+            tgt_img = y_np[i, 0] * std + mean  # physical units
+            prd_img = p_np[i, 0] * std + mean  # physical units
 
             vmin = min(in_img.min(), tgt_img.min(), prd_img.min())
             vmax = max(in_img.max(), tgt_img.max(), prd_img.max())
@@ -816,9 +825,10 @@ class Trainer:
 
     def _save_full_image_tiled(self, epoch: int):
         """
-        200x280 전체 도메인 한 장을 64x64 타일 슬라이딩 추론 후 PNG 저장.
-        full_x_example, full_y_example는 물리 단위 numpy [H,W].
-        동시에 PSNR/SSIM(물리 단위) 계산 및 로그/CSV 저장.
+        Run tiled inference over the full 200x280 domain and save a PNG.
+
+        full_x_example, full_y_example are numpy arrays [H, W] in physical units.
+        Also compute PSNR/SSIM in physical units and log to CSV.
         """
         if self.full_x_example is None or self.full_y_example is None:
             return
@@ -826,13 +836,13 @@ class Trainer:
         mean = self.stats["mean"]
         std = self.stats["std"]
 
-        # [H,W] -> [1,H,W] 텐서로 변환 후 정규화
+        # [H,W] -> [1,H,W] tensor, then normalize
         x_full = torch.from_numpy(self.full_x_example).float().unsqueeze(0)  # [1,H,W]
         y_full = torch.from_numpy(self.full_y_example).float().unsqueeze(0)  # [1,H,W]
 
         x_full_norm = (x_full - mean) / std  # [1,H,W]
 
-        # 타일 기반 추론
+        # Tiled inference
         pred_norm = predict_full_image_tiled(
             self.model,
             x_full_norm,          # [1,H,W]
@@ -841,16 +851,16 @@ class Trainer:
             device=self.device,
         )  # [1,H,W]
 
-        # 물리 단위로 역정규화
-        in_img = x_full.numpy()[0]              # 이미 물리 단위
-        tgt_img = y_full.numpy()[0]             # 물리 단위
-        prd_img = (pred_norm * std + mean).cpu().numpy()[0]  # 물리 단위
+        # Inverse normalization to physical units
+        in_img = x_full.numpy()[0]              # physical units
+        tgt_img = y_full.numpy()[0]             # physical units
+        prd_img = (pred_norm * std + mean).cpu().numpy()[0]  # physical units
 
-        # === PSNR/SSIM (물리 단위) 계산 ===
+        # === PSNR/SSIM (physical units) ===
         full_psnr = psnr_np(prd_img, tgt_img)
         full_ssim = ssim_np(prd_img, tgt_img)
 
-        # baseline이 있다면 같이 출력
+        # Print with baseline if available
         if (self.baseline_psnr is not None) and (self.baseline_ssim is not None):
             print(
                 f"[FULL] Epoch {epoch:03d} | PSNR={full_psnr:.3f} dB | SSIM={full_ssim:.4f} "
@@ -859,14 +869,14 @@ class Trainer:
         else:
             print(f"[FULL] Epoch {epoch:03d} | PSNR={full_psnr:.3f} dB | SSIM={full_ssim:.4f}")
 
-        # CSV 파일로 저장 (epoch, full_psnr, full_ssim, baseline_psnr, baseline_ssim)
+        # Append to CSV (epoch, full_psnr, full_ssim, baseline_psnr, baseline_ssim)
         with open(self.full_metrics_csv, "a", newline="") as f:
             writer = csv.writer(f)
             b_psnr = float(self.baseline_psnr) if self.baseline_psnr is not None else ""
             b_ssim = float(self.baseline_ssim) if self.baseline_ssim is not None else ""
             writer.writerow([int(epoch), float(full_psnr), float(full_ssim), b_psnr, b_ssim])
 
-        # === 그림 저장 ===
+        # === Save figure ===
         vmin = min(in_img.min(), tgt_img.min(), prd_img.min())
         vmax = max(in_img.max(), tgt_img.max(), prd_img.max())
 
@@ -899,7 +909,7 @@ class Trainer:
         self.model.train()
         running_loss = 0.0
 
-        # 혹시 앞 에폭에서 누적된 캐시가 있으면 정리
+        # Clear any cached memory from previous epochs
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -909,7 +919,7 @@ class Trainer:
             x = x.to(self.device, non_blocking=True)
             y = y.to(self.device, non_blocking=True)
 
-            # 추가 안전장치: 입력/타깃에서 NaN/Inf 제거
+            # Extra safety: remove NaN/Inf from input/target
             x = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
             y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -963,17 +973,17 @@ class Trainer:
                 continue
 
             total_loss += float(loss.detach().cpu())
-            # 패치 단위 (정규화 공간) PSNR/SSIM
+            # Patch-wise (normalized) PSNR/SSIM
             psnr_list.append(self._psnr(pred, y))
             ssim_val = 1.0 - float(ssim_metric(pred, y).detach().cpu())
             ssim_list.append(ssim_val)
 
-            # 첫 번째 배치에 대해서만 패치 PNG 저장 (각 epoch마다)
+            # Save patch PNGs for the first batch only (per epoch)
             if not first_batch_saved:
                 self._save_epoch_png(epoch, x, y, pred, max_samples=1)
                 first_batch_saved = True
 
-        # 전체 도메인(200x280) 한 장에 대해 타일 기반 전체 예측 PNG + PSNR/SSIM 저장
+        # Full-domain (200x280) inference + PSNR/SSIM PNG and logs
         self._save_full_image_tiled(epoch)
 
         avg_loss = total_loss / max(1, len(self.val_loader))
@@ -995,7 +1005,7 @@ class Trainer:
                 f"LR={cur_lr:.2e}"
             )
 
-            # 베스트 모델 저장 (val_loss 기준)
+            # Save best model based on validation loss
             if val_loss < self.best_val - 1e-6:
                 self.best_val = val_loss
                 ckpt = {
@@ -1003,17 +1013,18 @@ class Trainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "val_loss": val_loss,
-                    "stats": self.stats,   # 나중에 물리 단위 복원용
+                    "stats": self.stats,   # for inverse normalization in inference
                 }
                 save_path = os.path.join(self.out_dir, "best_model.pth")
                 torch.save(ckpt, save_path)
                 print(f"  ✅ Save best model → {save_path}")
 
+
 @torch.no_grad()
 def inference_and_save_netcdf(
     model: nn.Module,
-    x_all: np.ndarray,           # [T, H, W] 입력 데이터 (물리 단위)
-    y_all: np.ndarray,           # [T, H, W] 타깃 데이터 (물리 단위)
+    x_all: np.ndarray,           # [T, H, W] input data (physical units)
+    y_all: np.ndarray,           # [T, H, W] target data (physical units)
     stats: dict,                 # mean, std
     time_vals: np.ndarray,
     lat_vals: np.ndarray,
@@ -1022,36 +1033,36 @@ def inference_and_save_netcdf(
     tile_size: int = 64,
     tile_overlap: int = 16,
     output_nc_path: str = "tmax_predicted.nc",
-    batch_size: int = 8,         # 여러 시점을 배치로 처리
+    batch_size: int = 8,         # process multiple time steps per batch
 ):
     """
-    전체 time 시점에 대해 타일 기반 추론 수행 후 NetCDF로 저장
+    Perform tiled inference for all time steps and save results to NetCDF.
     """
     import xarray as xr
-    
+
     model.eval()
     mean = float(stats["mean"])
     std = float(stats["std"])
-    
+
     T, H, W = x_all.shape
     predictions = np.zeros_like(x_all, dtype=np.float32)  # [T, H, W]
-    
+
     print(f"[INFERENCE] Processing {T} timesteps with tile size {tile_size}x{tile_size}")
-    
-    # 배치 단위로 처리
+
+    # Process in mini-batches
     for t_start in tqdm(range(0, T, batch_size), desc="Inference"):
         t_end = min(t_start + batch_size, T)
         batch_indices = range(t_start, t_end)
-        
+
         for t in batch_indices:
-            # 입력 준비
+            # Prepare input
             x_slice = x_all[t]  # [H, W]
             x_tensor = torch.from_numpy(x_slice).float().unsqueeze(0)  # [1, H, W]
-            
-            # 정규화
+
+            # Normalize
             x_norm = (x_tensor - mean) / std
-            
-            # 타일 기반 추론
+
+            # Tiled inference
             pred_norm = predict_full_image_tiled(
                 model,
                 x_norm,
@@ -1059,14 +1070,14 @@ def inference_and_save_netcdf(
                 overlap=tile_overlap,
                 device=device,
             )  # [1, H, W]
-            
-            # 역정규화
+
+            # Inverse normalization
             pred_phys = (pred_norm * std + mean).cpu().numpy()[0]  # [H, W]
             predictions[t] = pred_phys
-    
-    # NetCDF 저장
+
+    # Save NetCDF
     print(f"[INFERENCE] Saving predictions to {output_nc_path}")
-    
+
     ds = xr.Dataset(
         {
             "tmax_predicted": (["time", "lat", "lon"], predictions),
@@ -1079,8 +1090,8 @@ def inference_and_save_netcdf(
             "lon": lon_vals,
         },
     )
-    
-    # 메타데이터 추가
+
+    # Metadata
     ds["tmax_predicted"].attrs = {
         "long_name": "Predicted maximum temperature",
         "units": "K",
@@ -1094,50 +1105,51 @@ def inference_and_save_netcdf(
         "long_name": "Target maximum temperature (observed)",
         "units": "K",
     }
-    
-    # 저장
+
     ds.to_netcdf(output_nc_path)
     print(f"[INFERENCE] ✅ Saved to {output_nc_path}")
-    
-    # 통계 계산
+
+    # Compute statistics
     print("\n[INFERENCE] Computing metrics...")
     psnr_vals = []
     ssim_vals = []
-    
+
     for t in tqdm(range(T), desc="Metrics"):
         pred = predictions[t]
         target = y_all[t]
         psnr_vals.append(psnr_np(pred, target))
         ssim_vals.append(ssim_np(pred, target))
-    
+
     print(f"[INFERENCE] Mean PSNR: {np.mean(psnr_vals):.3f} dB")
     print(f"[INFERENCE] Mean SSIM: {np.mean(ssim_vals):.4f}")
-    
+
     return predictions, ds
+
+
 # ---------------------------------------------------------
 # 6. main
 # ---------------------------------------------------------
 def main():
     CFG = SimpleNamespace(
-        # --- obs / 타깃 ---
+        # --- Obs / target ---
         obs_nc_path="tas_all_methods_comparison.nc",
         target_var="tas_obs",
 
-        # --- GCM 입력 설정 ---
-        use_gcm_input=True,             # True면 tasmin_raw 를 입력으로 사용
+        # --- GCM input settings ---
+        use_gcm_input=True,             # If True, use tasmin_raw as input
         gcm_nc_path="tas_all_methods_comparison.nc",
-        gcm_var="tas_gcm",           # tasmin_raw.nc 안 실제 변수 이름으로 수정하세요
+        gcm_var="tas_gcm",              # Replace with the actual variable name in tasmin_raw.nc
 
-        # (use_gcm_input=False 일 때 사용할 입력 변수)
-        input_var="tas_sr",          # obs_nc_path 안의 입력 변수
+        # (Input variable when use_gcm_input=False)
+        input_var="tas_sr",             # Input variable inside obs_nc_path
 
         device="cuda:0" if torch.cuda.is_available() else "cpu",
 
-        # 64x64 패치 기준 학습
+        # Training on 64x64 patches
         batch_size=32,
         val_batch_size=32,
         patch_size=64,
-        val_full_image=False,  # 검증도 64x64 (full 이미지는 타일 추론으로 별도 저장)
+        val_full_image=False,  # Validation also uses 64x64; full images are handled separately via tiled inference
 
         val_ratio=0.2,
         seed=42,
@@ -1147,12 +1159,12 @@ def main():
         out_dir="checkpoints_restormer_tas_irgcm",
         use_amp=False,
 
-        # 전체 도메인 예측용으로 사용할 time 인덱스 (예: 0번째 시점)
+        # Time index used for full-domain visualization (e.g., first time step)
         vis_time_index=0,
         tile_overlap=16,
-        
-        # Inference 설정 추가
-        do_inference=True,                    # inference 수행 여부
+
+        # Inference settings
+        do_inference=True,                    # Whether to perform inference
         inference_checkpoint="checkpoints_restormer_tas_irgcm/best_model.pth",
         inference_output_nc="tas_restormer_prediction.nc",
     )
@@ -1160,7 +1172,7 @@ def main():
     set_seed(CFG.seed)
     print_device()
 
-    # 1) NetCDF 로드 (GCM 사용 여부에 따라)
+    # 1) Load NetCDF (depending on whether GCM input is used)
     if CFG.use_gcm_input:
         print("[DATA] Using GCM tasmax_raw as input (interpolated to obs grid).")
         x, y, time_vals, lat_vals, lon_vals = load_gcm_regridded_to_obs(
@@ -1177,7 +1189,7 @@ def main():
 
     print(f"[DATA] time={x.shape[0]}, lat={x.shape[1]}, lon={x.shape[2]}")
 
-    # 2) DataLoader
+    # 2) DataLoaders
     train_loader, val_loader, stats = build_dataloaders(
         x,
         y,
@@ -1189,12 +1201,12 @@ def main():
         val_batch_size=CFG.val_batch_size,
     )
 
-    # 전체 도메인 예측용 예시 한 장 (물리 단위 numpy)
+    # Example full-domain images (physical units numpy arrays)
     vis_t = int(np.clip(CFG.vis_time_index, 0, x.shape[0] - 1))
-    full_x_example = x[vis_t]  # [H,W], 입력 (GCM 또는 tmax_vit)
+    full_x_example = x[vis_t]  # [H,W], input (GCM or tmax_vit)
     full_y_example = y[vis_t]  # [H,W], tmax_obs
 
-    # 3) 모델
+    # 3) Model
     model = build_restormer(inp_channels=1, out_channels=1)
 
     # 4) Trainer
@@ -1217,8 +1229,8 @@ def main():
 
     # trainer.fit()
     print("[DONE] Training finished.")
-    
-        # 학습된 모델 로드
+
+    # Load trained model
     if os.path.exists(CFG.inference_checkpoint):
         checkpoint = torch.load(CFG.inference_checkpoint, map_location=CFG.device)
         model.load_state_dict(checkpoint["model_state_dict"])
@@ -1227,8 +1239,8 @@ def main():
     else:
         print(f"[WARNING] Checkpoint not found: {CFG.inference_checkpoint}")
         print("[INFERENCE] Using current model state")
-    
-    # Inference 수행
+
+    # Perform inference
     predictions, ds = inference_and_save_netcdf(
         model=model,
         x_all=x,
@@ -1243,7 +1255,7 @@ def main():
         output_nc_path=CFG.inference_output_nc,
         batch_size=8,
     )
-    
+
     print("[DONE] Inference completed and saved to NetCDF.")
 
 
