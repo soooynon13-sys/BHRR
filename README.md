@@ -58,3 +58,38 @@ vit_bias_correction/
   main.py              # Full pipeline: data preparation → training → SSP inference
   inference.py         # Bias-correction inference utilities
   run.ipynb            # Example notebook (optional)
+
+restormer_stage/Rs2.py trains the Restormer on daily Tmax/Tas/Tmin using 64×64 patches, saving model checkpoints and PSNR/SSIM diagnostics.
+vit_bias_correction/utils.py computes GPU-accelerated fixed-range quantile maps and manages caching.
+vit_bias_correction/model.py defines the ViT block and SimpleViT model with optional sigmoid output to constrain quantile maps to [0, 1].
+vit_bias_correction/train.py provides training loops for fixed-range and standard modes, including default hyperparameter configurations.
+
+vit_bias_correction/main.py implements a three-step pipeline:
+1. Prepare historical quantile maps and cache them.
+2. Train the ViT model.
+3. Apply bias correction to multiple future SSP scenarios.
+
+## 4. Requirements
+
+The code is implemented in Python with PyTorch. Main dependencies include:
+python >= 3.9
+pytorch >= 1.12 (GPU recommended)
+xarray
+netCDF4
+numpy
+tqdm
+matplotlib
+scipy
+einops
+
+## 5. Data
+
+BHRR is designed for daily near-surface air temperature from CMIP6 GCMs and PGFv3:
+CMIP6 GCM: ACCESS-CM2 daily Tas/Tmax/Tmin (historical and SSP scenarios).
+Reference: Princeton Global Forcing v3 (PGFv3) 0.25° daily Tas/Tmax/Tmin.
+Benchmark: NEX-GDDP-CMIP6 downscaled projections for comparison (not required for training).
+
+Data availability:
+CMIP6 GCM: ESGF (e.g., CEDA node).
+NEX-GDDP-CMIP6: NASA NEX GDDP CMIP6 archive.
+PGFv3: Princeton Global Forcing v3 dataset (Hydrology group, University of Southampton).
